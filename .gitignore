@@ -1,0 +1,20 @@
+# secrets and deploy state: never publish these
+/release/
+.env*
+.vercel/
+*.pem
+
+# big raw sound libraries (inputs for tools/sounds; see sounds/CREDITS.md for where they come from)
+sounds/firearms/
+sounds/cc0/
+sounds/synth/
+sounds/clips/*.mp3
+
+# local tooling
+.claude/
+node_modules/
+
+# raw library archives
+sounds/*.7z
+*.7z
+*.zip

@@ -1,0 +1,115 @@
+<!--
+  ============================================================================
+   LOADER + AUTO-UPDATER
+   The game module (#tw-main) and import map (#tw-importmap) above are inert; this script starts them.
+   If a newer, signature-verified version of the game was downloaded earlier, that version is started
+   instead (document.open/write), so a single distributed file keeps itself up to date.
+   Config lives in the <meta name="tw-*"> tags in <head>, stamped by tools/release/release.mjs.
+  ============================================================================
+-->
+<script>
+(function () {
+  'use strict';
+  var meta = function (n) { var m = document.querySelector('meta[name="' + n + '"]'); return m ? (m.getAttribute('content') || '').trim() : ''; };
+  var VERSION = meta('tw-version') || '0.0.0', URL_ = meta('tw-update-url'), KEY = meta('tw-update-key');
+  var PENDING = 'tw-update-pending';
+  // shared across a document.open() swap (same Window), fresh after a reload
+  var U = window.TWUpdate = window.TWUpdate || {};
+  U.version = VERSION; U.url = URL_; U.status = URL_ && KEY ? 'idle' : 'off';
+
+  function cmp(a, b) {   // semver-ish compare: 1.10.0 > 1.9.3
+    a = String(a).split('.').map(Number); b = String(b).split('.').map(Number);
+    for (var i = 0; i < 3; i++) { var d = (a[i] || 0) - (b[i] || 0); if (d) return d > 0 ? 1 : -1; }
+    return 0;
+  }
+  function emit() { try { window.dispatchEvent(new CustomEvent('tw-update', { detail: U })); } catch (e) { } }
+
+  // ---- tiny key/value store: IndexedDB, falling back to localStorage -------------------------
+  function db() {
+    return new Promise(function (res, rej) {
+      if (!window.indexedDB) return rej(new Error('no IndexedDB'));
+      var r = indexedDB.open('tw-updates', 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore('kv'); };
+      r.onsuccess = function () { res(r.result); }; r.onerror = function () { rej(r.error); };
+    });
+  }
+  function tx(mode, fn) { return db().then(function (d) { return new Promise(function (res, rej) { var t = d.transaction('kv', mode), q = fn(t.objectStore('kv')); t.oncomplete = function () { res(q && q.result); }; t.onerror = function () { rej(t.error); }; }); }); }
+  function get(k) { return tx('readonly', function (s) { return s.get(k); }).catch(function () { try { return JSON.parse(localStorage.getItem('tw-upd-' + k)); } catch (e) { return null; } }); }
+  function put(k, v) { return tx('readwrite', function (s) { return s.put(v, k); }).catch(function () { localStorage.setItem('tw-upd-' + k, JSON.stringify(v)); }); }
+  function del(k) { return tx('readwrite', function (s) { return s.delete(k); }).catch(function () { }).then(function () { try { localStorage.removeItem('tw-upd-' + k); } catch (e) { } }); }
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { } }
+
+  // ---- start the game contained in THIS document ------------------------------------------
+  function boot() {
+    var im = document.getElementById('tw-importmap'), main = document.getElementById('tw-main');
+    var s = document.createElement('script'); s.type = 'importmap'; s.textContent = im.textContent; document.head.appendChild(s);
+    var m = document.createElement('script'); m.type = 'module'; m.textContent = main.textContent; document.body.appendChild(m);
+  }
+  // ---- replace this document with a downloaded newer version --------------------------------
+  function swap(rec) {
+    lsSet(PENDING, rec.version);   // cleared by the game once it has started (see U.bootOk)
+    U.swapped = rec.version;
+    document.open(); document.write(rec.html); document.close();
+  }
+  U.bootOk = function () { lsSet(PENDING, null); };
+
+  // ---- update check: update.json + signed index.html from the update server -----------------
+  function fetchT(url, ms) {
+    var c = new AbortController(), t = setTimeout(function () { c.abort(); }, ms);
+    return fetch(url, { signal: c.signal, cache: 'no-store' }).then(function (r) { clearTimeout(t); if (!r.ok) throw new Error('HTTP ' + r.status); return r; });
+  }
+  function b64(s) { return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); }); }
+  function verify(buf, sig) {   // ECDSA P-256 / SHA-256 over the exact file bytes
+    return crypto.subtle.importKey('spki', b64(KEY), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+      .then(function (key) { return crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, b64(sig), buf); });
+  }
+  var busy = false;
+  function check() {
+    if (U.status === 'off' || busy) return Promise.resolve(U);
+    if (!window.crypto || !crypto.subtle) { U.status = 'error'; U.msg = 'this browser context cannot verify update signatures'; emit(); return Promise.resolve(U); }
+    busy = true; U.status = 'checking'; U.msg = ''; emit();
+    var base = URL_.replace(/\/?$/, '/'), man;
+    return fetchT(base + 'update.json?t=' + Date.now(), 10000).then(function (r) { return r.json(); }).then(function (m) {
+      man = m;
+      if (!man || !man.version || !man.sig) throw new Error('bad update.json');
+      U.latest = man.version;
+      if (cmp(man.version, VERSION) <= 0) { U.status = 'latest'; return; }
+      return get('game').then(function (have) {
+        if (have && have.version === man.version) { U.status = 'ready'; U.ready = { version: have.version, notes: have.notes }; return; }
+        U.status = 'downloading'; emit();
+        return fetchT(base + (man.file || 'index.html') + '?v=' + encodeURIComponent(man.version), 120000).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+          if (man.size && buf.byteLength !== man.size) throw new Error('download incomplete');
+          return verify(buf, man.sig).then(function (ok) {
+            if (!ok) throw new Error('signature check failed, update rejected');
+            var html = new TextDecoder().decode(buf), vm = html.match(/<meta name="tw-version" content="([^"]+)"/);
+            if (!vm || vm[1] !== man.version) throw new Error('version tag mismatch');
+            return put('game', { version: man.version, html: html, notes: man.notes || '', date: Date.now() }).then(function () { U.status = 'ready'; U.ready = { version: man.version, notes: man.notes || '' }; });
+          });
+        });
+      });
+    }).catch(function (e) {
+      U.status = navigator.onLine === false ? 'offline' : 'error'; U.msg = String((e && e.message) || e);
+    }).then(function () { busy = false; emit(); return U; });
+  }
+  U.check = check;
+  U.restart = function () { location.reload(); };
+
+  // ---- decide what to run -----------------------------------------------------------------------
+  function later() { if (U.status === 'off') return emit(); setTimeout(check, 2500); if (!U.timer) U.timer = setInterval(check, 30 * 60 * 1000); }
+  if (U.swapped && U.swapped === VERSION) { boot(); later(); return; }   // we ARE the swapped-in update
+  get('game').then(function (rec) {
+    if (rec && rec.html && cmp(rec.version, VERSION) > 0) {
+      if (lsGet(PENDING) === rec.version) {   // last attempt to start this update never finished: throw it away
+        lsSet(PENDING, null); U.lastError = 'Update ' + rec.version + ' failed to start, so it was discarded. Running ' + VERSION + '.';
+        return del('game').then(function () { boot(); later(); });
+      }
+      return swap(rec);
+    }
+    if (rec) del('game');   // this file is already as new as the cached copy
+    boot(); later();
+  }).catch(function () { boot(); later(); });
+})();
+</script>
+</body>
+</html>
